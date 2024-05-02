@@ -1,5 +1,3 @@
-import os
-import sys
 import time
 import warnings
 from itertools import cycle
@@ -26,6 +24,9 @@ class Spectral:
     -----------
     seed : string
          The seedname of the CASTEP run, e.g.  <seedname>.bands.
+    use_vbm_fermi : boolean
+         Use the valence band maximum (VBM) as the Fermi energy.
+         This is particularly useful for instulators (default : False)
     zero_fermi : boolean
          Should the eigenvalues be shifted such that the Fermi energy is at the zero of energy (Default : True)
     zero_vbm : boolean
@@ -59,6 +60,7 @@ class Spectral:
     def __init__(self,
                  seed,
                  zero_fermi=True,
+                 use_vbm_fermi=False,
                  zero_vbm=False,
                  zero_cbm=False,
                  zero_shift=None,
@@ -98,6 +100,7 @@ class Spectral:
         self.zero_fermi = zero_fermi
         self.zero_vbm = zero_vbm
         self.zero_cbm = zero_cbm
+        self.use_vbm_fermi = use_vbm_fermi
 
         # First we try to open the file
 
@@ -181,8 +184,7 @@ class Spectral:
                 band_structure[:, k, 0] = eV * np.array([float(i) for i in lines[ind:ind + no_eigen]])
                 band_structure[:, k, 1] = eV * np.array([float(i) for i in lines[ind + no_eigen + 1:ind + no_eigen + 1 + no_eigen_2]])
 
-        # Decide on how we want to shift the bands based on user's preference - V Ravindran 31/01/2024
-        # NB: For zero_cbm and zero_vbm, we take the VBM/CBM from the first spin channel if spin polarised (arbitrarily).
+        # Get valence and conduction bands (for up spin if spin polarised)
         if no_spins == 1:
             vb_eigs = band_structure[int(no_electrons / 2) - 1, :, 0]
             cb_eigs = band_structure[int(no_electrons / 2), :, 0]
@@ -190,6 +192,17 @@ class Spectral:
             vb_eigs = band_structure[int(n_up) - 1, :, 0]
             cb_eigs = band_structure[int(n_up), :, 0]
 
+        # Decide if we now want to keep the CASTEP Fermi energy or use the VBM - V Ravindran 30/04/2024
+        if use_vbm_fermi is True:
+            fermi_energy = np.amax(vb_eigs) / eV
+            # Eigenvalues are already in the appropriate unit but Fermi energy was not converted initially
+            # Path of least resistance is to convert to Hartrees and then convert to eV again rather than changing the
+            # rest of the code.
+            # TODO If I can be bothered, I might actually refactor this initialisation bit it in the future...
+            self.Ef = fermi_energy * eV
+
+        # Decide on how we want to shift the bands based on user's preference - V Ravindran 31/01/2024
+        # NB: For zero_cbm and zero_vbm, we take the VBM/CBM from the first spin channel if spin polarised (arbitrarily).
         # The error handling for this is a bit of a pain in the arse for this one...
         # In order of preference(highest to lowest): zero_vbm,zero_shift,zero_cbm,zero_fermi (since it's default)
         if zero_vbm is True:
@@ -209,9 +222,10 @@ class Spectral:
             eng_shift = 0.0
 
         # Now perform the shift for real
-        for k in range(no_kpoints):
-            for ns in range(no_spins):
-                band_structure[:, k, ns] = band_structure[:, k, ns] - eng_shift
+        # for k in range(no_kpoints):
+        #     for ns in range(no_spins):
+        #         band_structure[:, k, ns] = band_structure[:, k, ns] - eng_shift
+        band_structure = band_structure - eng_shift  # Vectorized shift V Ravindran 30/04/2024
 
         # Don't forget to shift the Fermi energy as well V Ravindran 31/01/2024
         self.Ef = self.Ef - eng_shift
@@ -263,10 +277,6 @@ class Spectral:
         self.high_sym = high_sym
 
         # Set up the special points
-        warnings.filterwarnings("ignore")
-        # try:
-        # sys.stdout = open(os.devnull, 'w')
-
         def _get_high_sym_points_spg(cell):
             """Determine the high-symmetry points uisng the spacegroup.
 
@@ -364,20 +374,22 @@ class Spectral:
 
             return bv.get_special_points()
 
-        with open(os.devnull, "w") as devnull:
-            old_stdout = sys.stdout
-            sys.stdout = devnull
-            cell = io.read(seed+".cell")
-            # Default for special points is now to get them from space group. V Ravindran 20/04/2024
-            if high_sym_spacegroup is True:
-                special_points = _get_high_sym_points_spg(cell)
-            else:
-                # Get special from the crystal system of the computational cell.
-                bv_latt = cell.cell.get_bravais_lattice()
-                special_points = bv_latt.get_special_points()
-            sys.stdout = old_stdout
+        # This used to write to os.devnull because ASE would whinge about a missing CASTEP executable. V Ravindran CELL_READ 01/05/2024
+        # There is a way to correct this however using an ASE keyword.                                 V Ravindran CELL_READ 01/05/2024
+        # Moreover, this ensures that the JSON file for CASTEP will not be set up if the               V Ravindran CELL_READ 01/05/2024
+        # CASTEP_COMMAND environmental variable is set                                                 V Ravindran CELL_READ 01/05/2024
+        cell = io.read(seed + ".cell",
+                       # Do not check CASTEP keywords, the calculation is presumably correct! V CELL_READ Ravindran 01/05/2024
+                       calculator_args={"keyword_tolerance": 3}
+                       )
 
-        # sys.stdout = sys.__stdout__
+        # Default for special points is now to get them from space group. V Ravindran 20/04/2024
+        if high_sym_spacegroup is True:
+            special_points = _get_high_sym_points_spg(cell)
+        else:
+            # Get special from the crystal system of the computational cell.
+            bv_latt = cell.cell.get_bravais_lattice()
+            special_points = bv_latt.get_special_points()
 
         atoms = np.unique(cell.get_chemical_symbols())[::-1]
         mass = []
@@ -473,6 +485,9 @@ class Spectral:
 
         Author: V Ravindran (30/01/2024)
 
+        Updated: 01/05/2024 to use vectorised operations
+        Corrected ret_vbm_cbm to return vbms for each spin channel
+
         Parameters
         ----------
         silent : boolean
@@ -540,46 +555,48 @@ class Spectral:
             nelecs[0] = self.electrons
             nbands[0] = self.eig_up
 
-        vbm_i = np.empty(self.nspins, dtype=int)  # valence band maximum
-        cbm_i = np.empty(self.nspins, dtype=int)  # conduction band minimum
-        gap_in = np.empty(self.nspins)  # indirect gap
-        gap_dir = np.empty(self.nspins)  # direct gap
-        loc_in = np.empty((self.nspins, 2, 3))  # spin, VBM/CBM, coordinates
-        loc_dir = np.empty((self.nspins, 3))  # spin, coordinates
-        vb_width = np.empty(self.nspins)
-        cb_width = np.empty(self.nspins)
-
         # Set occupancies
+        # TODO MAKE THIS A FUNCTION - for non-collinear, we have twice the number of bands as there are two spinor components although only one spin
         occ = 1
         if (self.nspins == 1):
             # If not spin polarised, then we are doubly occupying levels
             occ = 2
 
-        # Get gaps for each spin channel
+        # Vectorised operations V Ravindran 01/05/2024
+        # Get valence and conduction bands for each spin
+        vb_eigs = np.empty((self.nspins, self.n_kpoints))
+        cb_eigs = np.empty((self.nspins, self.n_kpoints))
         for ns in range(self.nspins):
-            vb_eigs = self.BandStructure[int(nelecs[ns] / occ) - 1, :, ns]
-            cb_eigs = self.BandStructure[int(nelecs[ns] / occ), :, ns]
+            vb_eigs[ns] = self.BandStructure[int(nelecs[ns] / occ) - 1, :, ns]
+            cb_eigs[ns] = self.BandStructure[int(nelecs[ns] / occ), :, ns]
 
-            # Determine valence band maximum and conduction band minimum to get direct gap
-            # NB: It may not actually be indirect, in direct gapped insulators, gap_dir = gap_in
-            vbm_i[ns], cbm_i[ns] = np.argmax(vb_eigs), np.argmin(cb_eigs)
-            gap_in[ns] = cb_eigs[cbm_i[ns]] - vb_eigs[vbm_i[ns]]
+        # Determine valence band maximum and conduction band minimum to get (indirect) gap
+        # NB: It may not actually be indirect, in direct gapped insulators, gap_dir = gap_in
+        vbm_i = np.argmax(vb_eigs, axis=1)  # valence band maximum kpt index
+        cbm_i = np.argmin(cb_eigs, axis=1)  # conduction band minimum kpt index
+        vbm_eig = np.max(vb_eigs, axis=1)
+        cbm_eig = np.min(cb_eigs, axis=1)
+        gap_in = cbm_eig - vbm_eig
 
-            # Determine locations of the valence band minimum and conduction band maximum
+        # At this point, decide if we just want to know where the VBM and CBM are
+        if ret_vbm_cbm is True:
+            return vbm_i, cbm_i, vbm_eig, cbm_eig
+
+        # Determine locations of the valence band minimum and conduction band maximum
+        loc_in = np.empty((self.nspins, 2, 3))  # spin, VBM/CBM, coordinates
+        loc_dir = np.empty((self.nspins, 3))
+        gap_dir = np.empty(self.nspins)
+        for ns in range(self.nspins):
             loc_in[ns, 0, :] = self.kpoint_list[vbm_i[ns]]
             loc_in[ns, 1, :] = self.kpoint_list[cbm_i[ns]]
 
             # Now do the direct gap
-            gap_dir[ns] = cb_eigs[vbm_i[ns]] - vb_eigs[vbm_i[ns]]
+            gap_dir[ns] = cb_eigs[ns, vbm_i[ns]] - vb_eigs[ns, vbm_i[ns]]
             loc_dir[ns, :] = self.kpoint_list[vbm_i[ns]]
 
-            # Get the band widths
-            vb_width[ns] = np.max(vb_eigs) - np.min(vb_eigs)
-            cb_width[ns] = np.max(cb_eigs) - np.min(cb_eigs)
-
-        # At this point, decide if we just want to know where the VBM and CBM are
-        if ret_vbm_cbm is True:
-            return vbm_i, cbm_i, np.max(vb_eigs), np.min(cb_eigs)
+        # Get the band widths
+        vb_width = np.max(vb_eigs, axis=1) - np.min(vb_eigs, axis=1)
+        cb_width = np.max(cb_eigs, axis=1) - np.min(cb_eigs, axis=1)
 
         # Decide on the energy unit
         eng_unit = 'Hartrees'
@@ -588,6 +605,8 @@ class Spectral:
         # Now put everything into band_info
         band_info['nelec'] = nelecs
         band_info['nbands'] = nbands
+        band_info['vbm'] = vbm_eig
+        band_info['cbm'] = cbm_eig
         band_info['gap_indir'] = gap_in
         band_info['loc_indir'] = loc_in
         band_info['gap_dir'] = gap_dir
@@ -613,6 +632,8 @@ class Spectral:
                 print('No. of bands:     ', nbands[ns])
                 kx_vbm, ky_vbm, kz_vbm = loc_in[ns, 0, :]
                 kx_cbm, ky_cbm, kz_cbm = loc_in[ns, 1, :]
+                print(f'Valence band maximum    (VBM): {vbm_eig[ns]:.6f} {eng_unit}')
+                print(f'Conduction band maximum (CBM): {cbm_eig[ns]:.6f} {eng_unit}')
                 print('Indirect gap: {:.6f} {}  from {:.6f} {:.6f} {:.6f} --> {:.6f} {:.6f} {:.6f}'.format(
                     gap_in[ns], eng_unit,
                     kx_vbm, ky_vbm, kz_vbm,
